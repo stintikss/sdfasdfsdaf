@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import io
+import re
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -92,6 +93,7 @@ def main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Обзор", callback_data="dashboard"),
          InlineKeyboardButton(text="🏦 Активы", callback_data="assets")],
+        [InlineKeyboardButton(text="💱 Курсы валют", callback_data="rates")],
         [InlineKeyboardButton(text="💸 Доход / расход", callback_data="money"),
          InlineKeyboardButton(text="🎯 Цели", callback_data="goals")],
         [InlineKeyboardButton(text="📈 Прогноз и аналитика", callback_data="analytics")],
@@ -296,11 +298,64 @@ async def user_only(uid):
     return OWNER_ID == 0 or uid == OWNER_ID
 
 
-async def safe_edit(call, text, reply_markup=None):
+def make_section_image(title: str, subtitle: str = "PERSONAL FINANCE"):
+    """Create a themed visual card for each bot section, so every menu opens with an image."""
+    width, height = 1200, 460
+    image = Image.new("RGB", (width, height), (11, 18, 35))
+    draw = ImageDraw.Draw(image, "RGBA")
+    # Decorative gradient and soft geometric accents.
+    for y in range(height):
+        t = y / max(1, height - 1)
+        draw.line((0, y, width, y), fill=(int(11+7*t), int(18+13*t), int(35+23*t), 255))
+    draw.ellipse((850, -170, 1370, 340), fill=(35, 198, 165, 35))
+    draw.ellipse((-190, 290, 330, 810), fill=(75, 120, 255, 30))
     try:
-        await call.message.edit_text(text, reply_markup=reply_markup)
+        small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 25)
+        title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 48)
+        label_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 23)
+    except OSError:
+        small = title_font = label_font = ImageFont.load_default()
+    draw.text((62, 46), subtitle.upper()[:45], font=small, fill=(99, 220, 195, 255))
+    # Wrap long headings to keep them inside the card.
+    words = title.split()
+    lines, line = [], ""
+    for word in words:
+        candidate = (line + " " + word).strip()
+        if draw.textbbox((0, 0), candidate, font=title_font)[2] > 1060 and line:
+            lines.append(line); line = word
+        else:
+            line = candidate
+    if line: lines.append(line)
+    for i, value in enumerate(lines[:2]):
+        draw.text((60, 112 + i*62), value, font=title_font, fill=(245, 248, 255, 255))
+    cards = [(62, 285, 315, 385), (335, 285, 588, 385), (608, 285, 861, 385), (881, 285, 1134, 385)]
+    labels = ["МОЙ БАЛАНС", "КОНТРОЛЬ", "ПЛАНИРОВАНИЕ", "АНАЛИТИКА"]
+    for idx, (coords, label) in enumerate(zip(cards, labels)):
+        draw.rounded_rectangle(coords, radius=18, fill=(25, 41, 67, 220), outline=(70, 105, 145, 150), width=2)
+        x1, y1, _, _ = coords
+        draw.ellipse((x1+18, y1+27, x1+32, y1+41), fill=(53, 208, 174, 255))
+        draw.text((x1+45, y1+25), label, font=label_font, fill=(225, 235, 250, 255))
+    output = io.BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
+async def safe_edit(call, text, reply_markup=None):
+    """Replace the current section with a designed image card, caption and inline buttons."""
+    plain = re.sub(r"<[^>]+>", "", text).strip()
+    title = plain.splitlines()[0] if plain else "Финансовый раздел"
+    title = re.sub(r"^[^A-Za-zА-Яа-я0-9]+", "", title).strip() or "Финансовый раздел"
+    caption = text if len(text) <= 1024 else text[:1010].rsplit("\n", 1)[0] + "\n…"
+    try:
+        await call.message.delete()
     except Exception:
-        await call.message.answer(text, reply_markup=reply_markup)
+        pass
+    photo = BufferedInputFile(make_section_image(title), filename="finance_section.png")
+    sent = await call.message.answer_photo(photo, caption=caption, reply_markup=reply_markup, parse_mode="HTML")
+    if len(text) > len(caption):
+        remainder = text[len(caption):].strip()
+        if remainder:
+            await sent.answer(remainder, parse_mode="HTML")
 
 
 async def dashboard_text(uid):
@@ -408,6 +463,33 @@ async def dashboard(call: CallbackQuery):
         await call.message.answer_photo(photo, caption=text[:1024], reply_markup=kb, parse_mode="HTML")
     except Exception:
         await safe_edit(call, text, kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "rates")
+async def rates_page(call: CallbackQuery):
+    """Show official CBR rates. Calculations in this starter currently convert USD and RUB only."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "FinBot/1.0"}) as session:
+            async with session.get(CBR_URL) as response:
+                response.raise_for_status()
+                body = await response.read()
+        root = ET.fromstring(body)
+        rate_date = root.attrib.get("Date", "дата не указана")
+        wanted = {"USD": "🇺🇸 Доллар США", "EUR": "🇪🇺 Евро", "CNY": "🇨🇳 Юань", "GBP": "🇬🇧 Фунт стерлингов", "TRY": "🇹🇷 Турецкая лира", "AED": "🇦🇪 Дирхам ОАЭ", "KZT": "🇰🇿 Казахстанский тенге", "BYN": "🇧🇾 Белорусский рубль"}
+        lines = ["💱 <b>ОФИЦИАЛЬНЫЕ КУРСЫ ЦБ РФ</b>", f"Дата курса: <b>{rate_date}</b>", "━━━━━━━━━━━━━━━━━━"]
+        for item in root.findall("Valute"):
+            code = item.findtext("CharCode", "")
+            if code in wanted:
+                nominal = Decimal(item.findtext("Nominal", "1"))
+                value = Decimal(item.findtext("Value", "0").replace(",", ".")) / nominal
+                lines.append(f"{wanted[code]} ({code}): <b>{value:.4f} ₽</b> за 1 единицу")
+        lines += ["", "Источник: Банк России.", "⚠️ Сейчас автоматический пересчёт активов реализован для RUB и USD. Другие валюты здесь показываются справочно и не конвертируются в общий капитал."]
+        await safe_edit(call, "\n".join(lines), back_kb())
+    except Exception:
+        log.exception("Не удалось загрузить список курсов валют")
+        await safe_edit(call, "💱 <b>Курсы валют временно недоступны.</b> Попробуй ещё раз позже.", back_kb())
     await call.answer()
 
 
