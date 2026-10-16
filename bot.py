@@ -1,10 +1,14 @@
 import asyncio
 import logging
 import os
+import io
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 import asyncpg
+import aiohttp
+from PIL import Image, ImageDraw, ImageFont
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
@@ -25,6 +29,8 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DASHBOARD_IMAGE_URL = os.getenv("DASHBOARD_IMAGE_URL", "").strip()
 DEFAULT_USD_RATE = Decimal(os.getenv("USD_RUB_RATE", "90"))
+CBR_URL = "https://www.cbr.ru/scripts/XML_daily.asp"
+FX_RATE_DATE = "не обновлялся"
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 pool = None
@@ -104,6 +110,42 @@ def back_kb(target="home"):
     ])
 
 
+
+def make_menu_image(rate: Decimal):
+    """Обложка главного меню без выдуманных нулевых балансов."""
+    width, height = 1200, 520
+    image = Image.new("RGB", (width, height), (12, 20, 38))
+    pixels = image.load()
+    for y in range(height):
+        t = y / max(1, height - 1)
+        color = (int(12 + 10*t), int(20 + 15*t), int(38 + 24*t))
+        for x in range(width):
+            pixels[x, y] = color
+    draw = ImageDraw.Draw(image, "RGBA")
+    draw.ellipse((850, -170, 1350, 320), fill=(35, 198, 165, 45))
+    draw.ellipse((-180, 320, 320, 820), fill=(75, 120, 255, 30))
+    try:
+        normal = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 26)
+        small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
+        bold = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 48)
+        medium = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 29)
+    except OSError:
+        normal = small = bold = medium = ImageFont.load_default()
+    draw.text((62, 46), "PERSONAL FINANCE", font=medium, fill=(226, 238, 255, 255))
+    draw.text((62, 104), "ТВОЙ ФИНАНСОВЫЙ ЦЕНТР", font=bold, fill=(255, 255, 255, 255))
+    draw.text((64, 174), f"Официальный курс ЦБ РФ: 1 USD = {rate:.4f} RUB", font=normal, fill=(145, 221, 207, 255))
+    items = [("01", "АКТИВЫ"), ("02", "ДОХОДЫ И РАСХОДЫ"), ("03", "ФИНАНСОВЫЕ ЦЕЛИ"), ("04", "АНАЛИТИКА")]
+    x = 62
+    for number, label in items:
+        draw.rounded_rectangle((x, 270, x+250, 390), radius=22, fill=(25, 41, 67, 230), outline=(82, 112, 150, 120), width=2)
+        draw.text((x+20, 288), number, font=small, fill=(53, 208, 174, 255))
+        draw.text((x+20, 332), label, font=small, fill=(237, 244, 255, 255))
+        x += 275
+    draw.text((62, 452), "Управляй балансом. Следи за целями. Планируй будущее.", font=normal, fill=(143, 163, 190, 255))
+    output = io.BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
 async def init_db():
     global pool
     if not DATABASE_URL:
@@ -115,6 +157,10 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS users(
           user_id BIGINT PRIMARY KEY, usd_rub NUMERIC NOT NULL DEFAULT 90,
           show_usd BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT now()
+        );
+        CREATE TABLE IF NOT EXISTS fx_rates(
+          id INTEGER PRIMARY KEY CHECK (id = 1), usd_rub NUMERIC NOT NULL,
+          rate_date TEXT NOT NULL, fetched_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         CREATE TABLE IF NOT EXISTS assets(
           id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, name TEXT NOT NULL,
@@ -141,8 +187,104 @@ async def init_db():
 
 
 async def ensure_user(uid):
+    rate = await get_current_rate()
     async with pool.acquire() as c:
-        await c.execute("INSERT INTO users(user_id, usd_rub) VALUES($1,$2) ON CONFLICT(user_id) DO NOTHING", uid, DEFAULT_USD_RATE)
+        await c.execute("INSERT INTO users(user_id, usd_rub) VALUES($1,$2) ON CONFLICT(user_id) DO NOTHING", uid, rate)
+
+
+async def get_current_rate():
+    async with pool.acquire() as c:
+        row = await c.fetchrow("SELECT usd_rub FROM fx_rates WHERE id=1")
+    return Decimal(row["usd_rub"]) if row else DEFAULT_USD_RATE
+
+
+async def get_rate_info():
+    async with pool.acquire() as c:
+        row = await c.fetchrow("SELECT usd_rub, rate_date, fetched_at FROM fx_rates WHERE id=1")
+    if row:
+        return Decimal(row["usd_rub"]), row["rate_date"], row["fetched_at"]
+    return DEFAULT_USD_RATE, "нет данных ЦБ РФ", None
+
+
+async def refresh_usd_rate():
+    """Загружает официальный курс USD/RUB с сайта Банка России."""
+    global FX_RATE_DATE
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "FinBot/1.0"}) as session:
+        async with session.get(CBR_URL) as response:
+            response.raise_for_status()
+            body = await response.read()
+    root = ET.fromstring(body)
+    rate_date = root.attrib.get("Date", "неизвестная дата")
+    usd = next((item for item in root.findall("Valute") if item.findtext("CharCode") == "USD"), None)
+    if usd is None:
+        raise ValueError("В ответе Банка России не найден курс USD")
+    raw = usd.findtext("Value", "").replace(",", ".")
+    rate = Decimal(raw)
+    if rate <= 0:
+        raise ValueError("Банк России вернул некорректный курс")
+    async with pool.acquire() as c:
+        await c.execute("""
+          INSERT INTO fx_rates(id, usd_rub, rate_date, fetched_at) VALUES(1,$1,$2,now())
+          ON CONFLICT(id) DO UPDATE SET usd_rub=EXCLUDED.usd_rub,
+          rate_date=EXCLUDED.rate_date, fetched_at=now()
+        """, rate, rate_date)
+        await c.execute("UPDATE users SET usd_rub=$1", rate)
+    FX_RATE_DATE = rate_date
+    log.info("Обновлён официальный курс USD/RUB: %s, дата курса %s", rate, rate_date)
+    return rate
+
+
+async def rate_refresh_loop():
+    while True:
+        try:
+            await refresh_usd_rate()
+        except Exception:
+            log.exception("Не удалось обновить курс USD/RUB; используем последнее сохранённое значение")
+        await asyncio.sleep(6 * 60 * 60)
+
+
+def make_dashboard_image(total_rub: Decimal, rub: Decimal, usd: Decimal, rate: Decimal, title="FINANCE OVERVIEW"):
+    """Создаёт стильную карточку-изображение с актуальными цифрами."""
+    width, height = 1200, 650
+    image = Image.new("RGB", (width, height), (12, 20, 38))
+    pixels = image.load()
+    for y in range(height):
+        t = y / max(1, height - 1)
+        color = (int(12 + 12*t), int(20 + 15*t), int(38 + 24*t))
+        for x in range(width):
+            pixels[x, y] = color
+    draw = ImageDraw.Draw(image, "RGBA")
+    draw.ellipse((850, -180, 1370, 340), fill=(35, 198, 165, 42))
+    draw.ellipse((-170, 400, 360, 920), fill=(75, 120, 255, 28))
+    try:
+        font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        bold_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        f_small = ImageFont.truetype(font_path, 25)
+        f_label = ImageFont.truetype(font_path, 23)
+        f_value = ImageFont.truetype(bold_path, 48)
+        f_total = ImageFont.truetype(bold_path, 62)
+        f_title = ImageFont.truetype(bold_path, 31)
+    except OSError:
+        f_small = f_label = f_value = f_total = f_title = ImageFont.load_default()
+    draw.text((64, 48), title, font=f_title, fill=(226, 238, 255, 255))
+    draw.text((64, 103), "YOUR PERSONAL FINANCIAL HUB", font=f_small, fill=(139, 160, 190, 255))
+    draw.rounded_rectangle((55, 165, 1145, 370), radius=30, fill=(26, 42, 68, 230), outline=(83, 115, 151, 110), width=2)
+    draw.text((88, 195), "TOTAL CAPITAL · RUB EQUIVALENT", font=f_label, fill=(152, 180, 207, 255))
+    draw.text((88, 242), f"{total_rub:,.2f} ₽".replace(",", " "), font=f_total, fill=(255, 255, 255, 255))
+    cards = [(55, 405, 400, 565), (427, 405, 772, 565), (799, 405, 1145, 565)]
+    labels = [("RUB ASSETS", f"{rub:,.2f} ₽".replace(",", " "), (53, 204, 177, 255)),
+              ("USD ASSETS", f"${usd:,.2f}", (117, 164, 255, 255)),
+              ("OFFICIAL USD/RUB", f"{rate:.4f} ₽", (250, 190, 92, 255))]
+    for rect, (label, value, accent) in zip(cards, labels):
+        draw.rounded_rectangle(rect, radius=24, fill=(24, 37, 60, 235), outline=(82, 106, 140, 110), width=2)
+        draw.rounded_rectangle((rect[0]+22, rect[1]+22, rect[0]+31, rect[3]-22), radius=4, fill=accent)
+        draw.text((rect[0]+50, rect[1]+30), label, font=f_label, fill=(148, 169, 195, 255))
+        draw.text((rect[0]+50, rect[1]+78), value, font=f_value, fill=(245, 249, 255, 255))
+    draw.text((62, 600), "PERSONAL TRACKER  •  VALUES ARE USER-ENTERED", font=f_small, fill=(119, 143, 172, 255))
+    output = io.BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
 
 
 async def get_settings(uid):
@@ -163,7 +305,7 @@ async def safe_edit(call, text, reply_markup=None):
 
 async def dashboard_text(uid):
     settings = await get_settings(uid)
-    rate = Decimal(settings["usd_rub"])
+    rate, rate_date, _ = await get_rate_info()
     async with pool.acquire() as c:
         assets = await c.fetch("SELECT * FROM assets WHERE user_id=$1 AND active=TRUE", uid)
         sums = await c.fetchrow("""
@@ -195,7 +337,8 @@ async def dashboard_text(uid):
         f"🌍 <b>Общий капитал в RUB:</b> {money(total_rub)}",
     ]
     if settings["show_usd"]:
-        lines.append(f"🔁 <b>Эквивалент в USD:</b> {money(total_rub / rate if rate else 0, '$')}  (курс {money(rate, '₽')}/$)")
+        lines.append(f"🔁 <b>Эквивалент в USD:</b> {money(total_rub / rate if rate else 0, '$')}")
+    lines.append(f"💱 <b>Официальный курс ЦБ РФ:</b> {money(rate, '₽')} за $1 · дата курса {rate_date}")
     lines += [
         "",
         f"🌱 <b>Оценка начислений за день:</b> ~{money(interest_day_rub)}",
@@ -222,7 +365,9 @@ async def start(message: Message, state: FSMContext):
         return await message.answer("🔒 Этот личный бухгалтер доступен только владельцу.")
     await ensure_user(uid)
     await state.clear()
-    await message.answer("Привет! Я твой личный финансовый центр. Все данные хранятся в PostgreSQL.\n\nВыбери раздел:", reply_markup=main_kb())
+    rate = await get_current_rate()
+    photo = BufferedInputFile(make_menu_image(rate), filename="welcome.png")
+    await message.answer_photo(photo, caption="🏠 <b>Главное меню</b>\nВыбирай раздел. Картинка обновляется с финансовой сводкой в разделе «Обзор».", reply_markup=main_kb(), parse_mode="HTML")
 
 
 @dp.message(Command("id"))
@@ -233,7 +378,9 @@ async def show_id(message: Message):
 @dp.callback_query(F.data == "home")
 async def home(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await safe_edit(call, "🏠 <b>Главное меню</b>\nВыбирай раздел:", main_kb())
+    rate = await get_current_rate()
+    photo = BufferedInputFile(make_menu_image(rate), filename="welcome.png")
+    await call.message.answer_photo(photo, caption="🏠 <b>Главное меню</b>\nВыбирай раздел:", reply_markup=main_kb(), parse_mode="HTML")
     await call.answer()
 
 
@@ -248,12 +395,18 @@ async def dashboard(call: CallbackQuery):
         [InlineKeyboardButton(text="📈 Прогноз", callback_data="analytics")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="home")]
     ])
-    if DASHBOARD_IMAGE_URL:
-        try:
-            await call.message.answer_photo(DASHBOARD_IMAGE_URL, caption=text, reply_markup=kb, parse_mode="HTML")
-        except Exception:
-            await safe_edit(call, text, kb)
-    else:
+    settings = await get_settings(uid)
+    rate, _, _ = await get_rate_info()
+    async with pool.acquire() as c:
+        rows = await c.fetch("SELECT amount, currency FROM assets WHERE user_id=$1 AND active=TRUE", uid)
+    rub_total = sum((Decimal(r["amount"]) for r in rows if r["currency"] != "USD"), Decimal("0"))
+    usd_total = sum((Decimal(r["amount"]) for r in rows if r["currency"] == "USD"), Decimal("0"))
+    total = rub_total + usd_total * rate
+    photo_bytes = make_dashboard_image(total, rub_total, usd_total, rate)
+    photo = BufferedInputFile(photo_bytes, filename="finance_dashboard.png")
+    try:
+        await call.message.answer_photo(photo, caption=text[:1024], reply_markup=kb, parse_mode="HTML")
+    except Exception:
         await safe_edit(call, text, kb)
     await call.answer()
 
@@ -623,7 +776,7 @@ async def wish_delete(call: CallbackQuery):
 async def analytics(call: CallbackQuery):
     uid = call.from_user.id
     settings = await get_settings(uid)
-    rate = Decimal(settings["usd_rub"])
+    rate = await get_current_rate()
     async with pool.acquire() as c:
         rows = await c.fetch("""SELECT kind,currency,COALESCE(SUM(amount),0) amount FROM transactions
         WHERE user_id=$1 AND created_at>=now()-interval '30 days' GROUP BY kind,currency""", uid)
@@ -665,13 +818,29 @@ async def history(call: CallbackQuery):
 
 @dp.callback_query(F.data == "settings")
 async def settings(call: CallbackQuery):
-    s = await get_settings(call.from_user.id)
+    rate, rate_date, fetched_at = await get_rate_info()
+    updated = fetched_at.strftime("%d.%m.%Y %H:%M UTC") if fetched_at else "пока нет успешного обновления"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"💱 Изменить курс USD/RUB (сейчас {s['usd_rub']})", callback_data="settings_rate")],
-        [InlineKeyboardButton(text=f"{'☑️' if s['show_usd'] else '⬜️'} Показывать эквивалент в USD", callback_data="settings_toggle_usd")],
+        [InlineKeyboardButton(text="🔄 Обновить курс сейчас", callback_data="settings_refresh_rate")],
+        [InlineKeyboardButton(text=f"{'☑️' if (await get_settings(call.from_user.id))['show_usd'] else '⬜️'} Показывать эквивалент в USD", callback_data="settings_toggle_usd")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="home")]
     ])
-    await safe_edit(call, "⚙️ <b>Настройки</b>\n\nКурс USD/RUB используется только для пересчёта общего капитала. Укажи курс вручную и обновляй при необходимости.", kb); await call.answer()
+    text = (f"⚙️ <b>Настройки</b>\n\n💱 <b>USD/RUB: {money(rate, '₽')} за $1</b>\n"
+            f"Источник: Банк России · дата курса: {rate_date}\nПоследняя проверка: {updated}\n\n"
+            "Курс обновляется автоматически примерно каждые 6 часов. Если сайт ЦБ РФ временно недоступен, используется последнее сохранённое значение.")
+    await safe_edit(call, text, kb); await call.answer()
+
+
+@dp.callback_query(F.data == "settings_refresh_rate")
+async def settings_refresh_rate(call: CallbackQuery):
+    try:
+        rate = await refresh_usd_rate()
+        _, rate_date, _ = await get_rate_info()
+        await call.answer(f"Курс обновлён: {rate} ₽ · {rate_date}", show_alert=True)
+    except Exception:
+        log.exception("Manual exchange-rate refresh failed")
+        await call.answer("Не удалось получить курс. Используется последнее сохранённое значение.", show_alert=True)
+    await settings(call)
 
 
 @dp.callback_query(F.data == "settings_toggle_usd")
@@ -740,7 +909,19 @@ async def main():
     if OWNER_ID == 0:
         log.warning("OWNER_ID=0: бот доступен всем. Укажи свой Telegram ID в Render для приватного режима.")
     await init_db()
-    await dp.start_polling(bot)
+    # Первое обновление курса до запуска меню; при сбое останется резервный курс.
+    try:
+        await refresh_usd_rate()
+    except Exception:
+        log.exception("Первое обновление курса не удалось; будет использован последний сохранённый курс")
+    rate_task = asyncio.create_task(rate_refresh_loop())
+    try:
+        await dp.start_polling(bot)
+    finally:
+        rate_task.cancel()
+        await bot.session.close()
+        if pool:
+            await pool.close()
 
 
 if __name__ == "__main__":
