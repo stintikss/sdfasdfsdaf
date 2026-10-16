@@ -1,0 +1,19 @@
+# Можно использовать Blueprint или перенести эти переменные в Dashboard Render.
+# Для polling лучше Background Worker (не Web Service).
+services:
+  - type: worker
+    name: personal-finance-telegram-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: USD_RUB_RATE
+        value: "90"
+      - key: DASHBOARD_IMAGE_URL
+        sync: false
